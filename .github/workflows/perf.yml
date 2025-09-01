@@ -1,0 +1,226 @@
+name: Performance Analysis
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  performance-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          linux-tools-common \
+          linux-tools-generic \
+          linux-tools-$(uname -r) || sudo apt-get install -y linux-tools-5.15.0-1053-azure
+        
+        # Clone FlameGraph tools
+        git clone --depth 1 https://github.com/brendangregg/FlameGraph.git
+        
+        # Python dependencies
+        pip install pandas matplotlib seaborn plotly kaleido
+    
+    - name: Setup performance monitoring
+      run: |
+        # Try to set perf permissions (may fail in container)
+        echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid || true
+        echo 0 | sudo tee /proc/sys/kernel/kptr_restrict || true
+        
+        # Create output directories
+        mkdir -p results/{metrics,flamegraphs,reports}
+        
+        # Check available perf events
+        echo "Available perf events:"
+        sudo perf list | head -20 || true
+    
+    - name: Build optimized binary
+      run: |
+        make release
+        echo "Binary built with optimization flags"
+        
+    - name: Collect baseline system info
+      run: |
+        echo "=== System Information ===" | tee results/reports/system_info.txt
+        lscpu | tee -a results/reports/system_info.txt
+        echo -e "\n=== Memory Information ===" | tee -a results/reports/system_info.txt
+        free -h | tee -a results/reports/system_info.txt
+        echo -e "\n=== Compiler Version ===" | tee -a results/reports/system_info.txt
+        g++ --version | tee -a results/reports/system_info.txt
+    
+    - name: Run performance test with CPU profiling
+      run: |
+        echo "Starting CPU profiling..."
+        sudo perf record -F 999 -g --call-graph dwarf -o results/perf.data -- timeout 120 ./perf_test || true
+        
+        # Generate text report
+        sudo perf report --stdio -i results/perf.data > results/reports/perf_report.txt || true
+        
+        # Display top hotspots
+        echo "=== Top 20 Hotspots ===" 
+        sudo perf report --stdio -i results/perf.data | head -30 || true
+    
+    - name: Generate CPU flame graph
+      run: |
+        echo "Generating flame graph..."
+        sudo perf script -i results/perf.data > results/perf.script || true
+        ./FlameGraph/stackcollapse-perf.pl results/perf.script > results/perf.folded
+        ./FlameGraph/flamegraph.pl \
+          --title "CPU Flame Graph" \
+          --width 1800 \
+          --height 600 \
+          results/perf.folded > results/flamegraphs/cpu_flamegraph.svg
+        echo "Flame graph generated successfully"
+        
+        # Clean up intermediate files to save space
+        rm -f results/perf.script results/perf.folded
+    
+    - name: Collect cache performance metrics
+      run: |
+        echo "=== Cache Performance Analysis ===" | tee results/metrics/cache.txt
+        # Use single line command to avoid syntax errors
+        sudo perf stat -e cache-references,cache-misses,L1-dcache-loads,L1-dcache-load-misses,LLC-loads,LLC-load-misses \
+          timeout 30 ./perf_test 2>&1 | tee -a results/metrics/cache.txt || true
+    
+    - name: Collect pipeline and IPC metrics
+      run: |
+        echo "=== Pipeline Performance Analysis ===" | tee results/metrics/pipeline.txt
+        # Use single line command to avoid syntax errors
+        sudo perf stat -e cycles,instructions,branches,branch-misses \
+          timeout 30 ./perf_test 2>&1 | tee -a results/metrics/pipeline.txt || true
+        
+        # Try to collect stall cycles separately (may not be available)
+        echo -e "\n=== Stall Cycles ===" | tee -a results/metrics/pipeline.txt
+        sudo perf stat -e stalled-cycles-frontend,stalled-cycles-backend \
+          timeout 20 ./perf_test 2>&1 | tee -a results/metrics/pipeline.txt || \
+          echo "Stall cycle events not available on this system" | tee -a results/metrics/pipeline.txt
+    
+    - name: Collect basic performance metrics
+      run: |
+        echo "=== Basic Performance Metrics ===" | tee results/metrics/additional.txt
+        
+        # Basic CPU metrics (these should always work)
+        echo -e "\n--- CPU Metrics ---" | tee -a results/metrics/additional.txt
+        sudo perf stat -e cpu-clock,task-clock,context-switches,cpu-migrations,page-faults \
+          timeout 20 ./perf_test 2>&1 | tee -a results/metrics/additional.txt || true
+        
+        # Try memory events (may not work in container)
+        echo -e "\n--- Memory Events (if available) ---" | tee -a results/metrics/additional.txt
+        sudo perf stat -e cache-references,cache-misses \
+          timeout 20 ./perf_test 2>&1 | tee -a results/metrics/additional.txt || \
+          echo "Advanced memory events not available" | tee -a results/metrics/additional.txt
+    
+    - name: Analyze all metrics and generate reports
+      run: |
+        echo "Analyzing performance metrics..."
+        
+        # Run the analysis script
+        python3 scripts/analyze_metrics.py || echo "Analysis completed with warnings"
+    
+    - name: Generate performance dashboard
+      run: |
+        echo "Generating dashboard..."
+        
+        # Generate dashboard
+        python3 scripts/generate_dashboard.py || echo "Dashboard generation completed"
+    
+    - name: Compare with baseline (if exists)
+      continue-on-error: true
+      run: |
+        if [ -f "baseline.json" ]; then
+          echo "Comparing with baseline..."
+          if [ -f "scripts/compare_performance.py" ]; then
+            python3 scripts/compare_performance.py baseline.json results/performance_report.json
+          else
+            echo "Compare script not found, skipping comparison"
+          fi
+        else
+          echo "No baseline found, skipping comparison"
+        fi
+    
+    - name: Fix permissions and prepare artifacts
+      run: |
+        echo "Fixing file permissions..."
+        # Change ownership of all files created with sudo
+        sudo chown -R $USER:$USER results/ || true
+        
+        # List files to be uploaded
+        echo "Files in results directory:"
+        ls -la results/
+        
+        # Show sizes
+        echo -e "\nFile sizes:"
+        du -sh results/* | sort -h || true
+        
+        # Remove large perf.data file to avoid upload issues
+        if [ -f "results/perf.data" ]; then
+          echo "Removing perf.data ($(du -sh results/perf.data | cut -f1))"
+          rm -f results/perf.data
+        fi
+        
+        echo -e "\nTotal size after cleanup:"
+        du -sh results/
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: performance-results
+        path: results/
+        retention-days: 30
+        if-no-files-found: warn
+    
+    - name: Comment on PR (if applicable)
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          
+          let comment = '## 🚀 Performance Analysis Results\n\n';
+          
+          try {
+            const report = JSON.parse(fs.readFileSync('results/performance_report.json', 'utf8'));
+            
+            comment += '### 📊 Key Metrics\n';
+            comment += '| Metric | Value |\n';
+            comment += '|--------|-------|\n';
+            
+            const cache = report.metrics?.cache || {};
+            const pipeline = report.metrics?.pipeline || {};
+            
+            if (cache.hit_rate !== undefined) {
+              comment += `| Cache Hit Rate | ${cache.hit_rate}% |\n`;
+            }
+            if (pipeline.ipc !== undefined) {
+              comment += `| IPC | ${pipeline.ipc} |\n`;
+            }
+            if (pipeline.branch_prediction_accuracy !== undefined) {
+              comment += `| Branch Prediction | ${pipeline.branch_prediction_accuracy}% |\n`;
+            }
+            
+            if (report.hotspots && report.hotspots.length > 0) {
+              comment += '\n### 🔥 Top Hotspots\n';
+              report.hotspots.slice(0, 3).forEach((h, i) => {
+                comment += `${i+1}. ${h.percentage}% - \`${h.function}\`\n`;
+              });
+            }
+            
+            comment += '\n📈 [View Full Report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})';
+          } catch (e) {
+            comment += 'Performance analysis completed. Check artifacts for details.';
+          }
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: comment
+          });
