@@ -76,8 +76,6 @@ jobs:
         ./FlameGraph/stackcollapse-perf.pl results/perf.script > results/perf.folded
         ./FlameGraph/flamegraph.pl \
           --title "CPU Flame Graph" \
-          --width 1800 \
-          --height 600 \
           results/perf.folded > results/flamegraphs/cpu_flamegraph.svg
         echo "Flame graph generated successfully"
         
@@ -96,8 +94,8 @@ jobs:
         -e dtlb_walk \
         -e sve_inst_spec \
         -e sve_pred_empty_spec \
-        -o "$STAT_OUTPUT_FILE" \
-        -- $CMD ./perf_test 2>&1 | tee -a results/metrics/cache.txt || true
+        -o results/metrics/cache.txt \
+        -- $CMD ./perf_test
     
     
     
