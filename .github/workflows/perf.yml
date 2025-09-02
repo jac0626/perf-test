@@ -88,64 +88,18 @@ jobs:
       run: |
         echo "=== Cache Performance Analysis ===" | tee results/metrics/cache.txt
         # Use single line command to avoid syntax errors
-        sudo perf stat -e cache-references,cache-misses,L1-dcache-loads,L1-dcache-load-misses,LLC-loads,LLC-load-misses \
-          timeout 30 ./perf_test 2>&1 | tee -a results/metrics/cache.txt || true
+        sudo perf stat -a \
+        -e inst_retired \
+        -e cycles \
+        -e stall_backend_mem \
+        -e l3d_cache_refill \
+        -e dtlb_walk \
+        -e sve_inst_spec \
+        -e sve_pred_empty_spec \
+        -o "$STAT_OUTPUT_FILE" \
+        -- $CMD ./perf_test 2>&1 | tee -a results/metrics/cache.txt || true
     
-    - name: Collect pipeline and IPC metrics
-      run: |
-        echo "=== Pipeline Performance Analysis ===" | tee results/metrics/pipeline.txt
-        # Use single line command to avoid syntax errors
-        sudo perf stat -e cycles,instructions,branches,branch-misses \
-          timeout 30 ./perf_test 2>&1 | tee -a results/metrics/pipeline.txt || true
-        
-        # Try to collect stall cycles separately (may not be available)
-        echo -e "\n=== Stall Cycles ===" | tee -a results/metrics/pipeline.txt
-        sudo perf stat -e stalled-cycles-frontend,stalled-cycles-backend \
-          timeout 20 ./perf_test 2>&1 | tee -a results/metrics/pipeline.txt || \
-          echo "Stall cycle events not available on this system" | tee -a results/metrics/pipeline.txt
     
-    - name: Collect basic performance metrics
-      run: |
-        echo "=== Basic Performance Metrics ===" | tee results/metrics/additional.txt
-        
-        # Basic CPU metrics (these should always work)
-        echo -e "\n--- CPU Metrics ---" | tee -a results/metrics/additional.txt
-        sudo perf stat -e cpu-clock,task-clock,context-switches,cpu-migrations,page-faults \
-          timeout 20 ./perf_test 2>&1 | tee -a results/metrics/additional.txt || true
-        
-        # Try memory events (may not work in container)
-        echo -e "\n--- Memory Events (if available) ---" | tee -a results/metrics/additional.txt
-        sudo perf stat -e cache-references,cache-misses \
-          timeout 20 ./perf_test 2>&1 | tee -a results/metrics/additional.txt || \
-          echo "Advanced memory events not available" | tee -a results/metrics/additional.txt
-    
-    - name: Analyze all metrics and generate reports
-      run: |
-        echo "Analyzing performance metrics..."
-        
-        # Run the analysis script
-        python3 scripts/analyze_metrics.py || echo "Analysis completed with warnings"
-    
-    - name: Generate performance dashboard
-      run: |
-        echo "Generating dashboard..."
-        
-        # Generate dashboard
-        python3 scripts/generate_dashboard.py || echo "Dashboard generation completed"
-    
-    - name: Compare with baseline (if exists)
-      continue-on-error: true
-      run: |
-        if [ -f "baseline.json" ]; then
-          echo "Comparing with baseline..."
-          if [ -f "scripts/compare_performance.py" ]; then
-            python3 scripts/compare_performance.py baseline.json results/performance_report.json
-          else
-            echo "Compare script not found, skipping comparison"
-          fi
-        else
-          echo "No baseline found, skipping comparison"
-        fi
     
     - name: Fix permissions and prepare artifacts
       run: |
