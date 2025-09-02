@@ -46,6 +46,7 @@ jobs:
       run: |
         make release
         echo "Binary built with optimization flags"
+        sudo perf list
         
     - name: Collect baseline system info
       run: |
