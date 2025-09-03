@@ -1,225 +1,132 @@
-// main.cpp - 性能测试程序
-// 包含多种计算模式以展示不同的性能特征
-
 #include <iostream>
 #include <vector>
-#include <random>
 #include <chrono>
-#include <cmath>
-#include <algorithm>
-#include <numeric>
-#include <cstring>
+#include <cstdint>
+#include <numeric> // For std::iota
 
-// 矩阵乘法 - CPU密集型，测试流水线和缓存
-void matrix_multiply(int size = 256) {
-    std::vector<std::vector<double>> a(size, std::vector<double>(size));
-    std::vector<std::vector<double>> b(size, std::vector<double>(size));
-    std::vector<std::vector<double>> c(size, std::vector<double>(size, 0.0));
+// 必须包含此头文件以使用 SVE 内联函数
+#include <arm_sve.h>
+
+/**
+ * @brief 使用 SVE 指令执行 SAXPY 操作 (Y = a * X + Y)
+ * 
+ * @param a 标量乘数
+ * @param x 输入向量 X
+ * @param y 输入/输出向量 Y
+ */
+void sve_saxpy(float a, const std::vector<float>& x, std::vector<float>& y) {
+    // 确保向量大小相同
+    if (x.size() != y.size()) {
+        throw std::runtime_error("Vector sizes must be equal.");
+    }
     
-    // 初始化矩阵
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_real_distribution<> dis(0.0, 1.0);
+    uint64_t n = x.size();
+    const float* x_ptr = x.data();
+    float* y_ptr = y.data();
+
+    // SVE 的循环方式：
+    // 使用一个谓词(predicate)来处理可能不是向量长度整数倍的数组尾部
+    for (uint64_t i = 0; i < n; ) {
+        // svwhilelt_b32: 创建一个谓词(pg)，对于 i+lane < n 的通道(lane)为 true
+        // 这有效地为循环的最后一次迭代创建了一个掩码
+        svbool_t pg = svwhilelt_b32(i, n);
+        
+        // svld1: 根据谓词 pg 从内存加载数据到向量寄存器
+        svfloat32_t vec_x = svld1_f32(pg, x_ptr + i);
+        svfloat32_t vec_y = svld1_f32(pg, y_ptr + i);
+        
+        // svmad_f32_z: 核心计算！执行 "multiply-add" 操作。
+        // result = (a * vec_x) + vec_y
+        // _z 后缀表示 "zeroing"，即谓词为 false 的通道将被置为 0
+        svfloat32_t result = svmad_f32_z(pg, svdup_n_f32(a), vec_x, vec_y);
+        
+        // svst1: 根据谓词 pg 将结果写回内存
+        svst1_f32(pg, y_ptr + i, result);
+        
+        // svcntw(): 获取当前硬件上 SVE 向量寄存器可以容纳的 32-bit 元素数量。
+        // 这是 "Scalable" 的关键！代码无需硬编码向量宽度。
+        i += svcntw();
+    }
+}
+
+int main() {
+    // ================== 1. 参数设置 ==================
+    const size_t VECTOR_SIZE = 10000000; // 1000 万个元素
+    const float a = 2.5f;
+    const int TARGET_DURATION_SECONDS = 120; // 目标运行时间：2分钟
+
+    std::cout << "SVE SAXPY Benchmark" << std::endl;
+    std::cout << "---------------------" << std::endl;
+    std::cout << "Target duration: " << TARGET_DURATION_SECONDS << " seconds" << std::endl;
+    std::cout << "Vector size:     " << VECTOR_SIZE << " elements" << std::endl;
     
-    for (int i = 0; i < size; ++i) {
-        for (int j = 0; j < size; ++j) {
-            a[i][j] = dis(gen);
-            b[i][j] = dis(gen);
+    // 打印当前 SVE 向量长度（以字节为单位）
+    std::cout << "SVE vector length: " << svcntb() * 8 << " bits (" << svcntb() << " bytes)" << std::endl;
+    std::cout << "---------------------" << std::endl;
+
+
+    // ================== 2. 数据初始化 ==================
+    std::cout << "Initializing vectors..." << std::endl;
+    std::vector<float> x(VECTOR_SIZE);
+    std::vector<float> y(VECTOR_SIZE);
+    std::vector<float> y_original(VECTOR_SIZE);
+
+    // 用一些值填充向量
+    std::iota(x.begin(), x.end(), 0.0f); // x = {0.0, 1.0, 2.0, ...}
+    for(size_t i = 0; i < VECTOR_SIZE; ++i) {
+        y[i] = static_cast<float>(VECTOR_SIZE - i);
+    }
+    y_original = y; // 保存 y 的初始状态，以便每次循环重置
+
+    std::cout << "Initialization complete. Starting computation." << std::endl;
+
+
+    // ================== 3. 主计算循环 ==================
+    auto start_time = std::chrono::high_resolution_clock::now();
+    long long iterations = 0;
+    
+    while (true) {
+        // 每次迭代前重置 y，以确保计算负载恒定
+        y = y_original;
+
+        // 执行核心计算
+        sve_saxpy(a, x, y);
+
+        iterations++;
+
+        auto current_time = std::chrono::high_resolution_clock::now();
+        auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(current_time - start_time).count();
+
+        // 每秒打印一次进度
+        if (iterations % 10 == 0) { // 减少打印频率
+            std::cout << "\rElapsed time: " << elapsed_seconds << "s, Iterations: " << iterations << std::flush;
+        }
+
+        if (elapsed_seconds >= TARGET_DURATION_SECONDS) {
+            break;
         }
     }
     
-    // 矩阵乘法 - 不同的循环顺序影响缓存性能
-    for (int i = 0; i < size; ++i) {
-        for (int k = 0; k < size; ++k) {
-            double temp = a[i][k];
-            for (int j = 0; j < size; ++j) {
-                c[i][j] += temp * b[k][j];
-            }
-        }
-    }
-}
+    std::cout << std::endl << "Computation finished." << std::endl;
 
-// 随机内存访问 - 测试缓存未命中
-void random_memory_access(size_t size = 64 * 1024 * 1024) {
-    std::vector<char> memory(size);
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<size_t> dis(0, size - 1);
-    
-    // 预热
-    std::fill(memory.begin(), memory.end(), 0);
-    
-    // 随机访问 - 导致大量缓存未命中
-    volatile char sum = 0;
-    for (int i = 0; i < 10000000; ++i) {
-        size_t index = dis(gen);
-        sum += memory[index];
-        memory[index] = sum;
-    }
-}
 
-// 顺序内存访问 - 测试缓存友好的访问模式
-void sequential_memory_access(size_t size = 64 * 1024 * 1024) {
-    std::vector<char> memory(size);
+    // ================== 4. 结果验证和报告 ==================
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
     
-    // 顺序写入
-    for (size_t i = 0; i < size; ++i) {
-        memory[i] = static_cast<char>(i & 0xFF);
-    }
+    std::cout << "---------------------" << std::endl;
+    std::cout << "Total iterations: " << iterations << std::endl;
+    std::cout << "Total time:       " << total_duration / 1000000.0 << " seconds" << std::endl;
+    double gflops = (2.0 * VECTOR_SIZE * iterations) / (total_duration / 1000000.0) / 1e9;
+    std::cout << "Performance:      " << gflops << " GFLOPS" << std::endl;
     
-    // 顺序读取并计算
-    volatile long long sum = 0;
-    for (int iter = 0; iter < 10; ++iter) {
-        for (size_t i = 0; i < size; ++i) {
-            sum += memory[i];
-        }
+    // 抽样验证结果是否正确
+    std::cout << "\nVerifying a few results..." << std::endl;
+    size_t indices_to_check[] = {0, 1, 42, VECTOR_SIZE / 2, VECTOR_SIZE - 1};
+    for(size_t idx : indices_to_check) {
+        float expected = a * x[idx] + y_original[idx];
+        std::cout << "y[" << idx << "]: Expected=" << expected << ", Got=" << y[idx] << std::endl;
     }
-}
 
-// 分支密集型代码 - 测试分支预测
-void branch_intensive(int iterations = 50000000) {
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dis(0, 100);
-    
-    volatile long long sum = 0;
-    
-    // 可预测的分支
-    for (int i = 0; i < iterations; ++i) {
-        if (i % 2 == 0) {
-            sum += i;
-        } else {
-            sum -= i;
-        }
-    }
-    
-    // 难以预测的分支
-    for (int i = 0; i < iterations / 10; ++i) {
-        int random_val = dis(gen);
-        if (random_val < 30) {
-            sum += random_val;
-        } else if (random_val < 60) {
-            sum *= 2;
-        } else if (random_val < 90) {
-            sum -= random_val;
-        } else {
-            sum /= 2;
-        }
-    }
-}
-
-// 浮点密集计算 - 测试浮点单元
-void floating_point_intensive(int iterations = 10000000) {
-    volatile double result = 1.0;
-    
-    for (int i = 1; i < iterations; ++i) {
-        double x = static_cast<double>(i);
-        result += std::sin(x) * std::cos(x);
-        result += std::sqrt(x) / std::log(x + 1);
-        result += std::exp(-x / 1000000.0);
-    }
-}
-
-// 递归函数 - 测试调用栈和函数调用开销
-long long fibonacci(int n) {
-    if (n <= 1) return n;
-    return fibonacci(n - 1) + fibonacci(n - 2);
-}
-
-void recursive_workload() {
-    volatile long long sum = 0;
-    for (int i = 30; i < 40; ++i) {
-        sum += fibonacci(i);
-    }
-}
-
-// 向量化友好的代码
-void vectorizable_loop(size_t size = 10000000) {
-    std::vector<float> a(size), b(size), c(size);
-    
-    // 初始化
-    for (size_t i = 0; i < size; ++i) {
-        a[i] = static_cast<float>(i);
-        b[i] = static_cast<float>(i * 2);
-    }
-    
-    // 向量化友好的循环
-    for (int iter = 0; iter < 100; ++iter) {
-        for (size_t i = 0; i < size; ++i) {
-            c[i] = a[i] * 2.5f + b[i] * 3.7f;
-        }
-        
-        // 防止优化掉
-        volatile float sum = std::accumulate(c.begin(), c.end(), 0.0f);
-    }
-}
-
-// 主函数
-int main(int argc, char* argv[]) {
-    using namespace std::chrono;
-    
-    auto start_time = high_resolution_clock::now();
-    auto target_duration = minutes(2); // 运行2分钟
-    
-    std::cout << "Starting performance test workload..." << std::endl;
-    std::cout << "Target duration: 2 minutes" << std::endl;
-    
-    int iteration = 0;
-    while (duration_cast<seconds>(high_resolution_clock::now() - start_time) < target_duration) {
-        iteration++;
-        
-        // 记录每个阶段
-        auto phase_start = high_resolution_clock::now();
-        
-        std::cout << "\nIteration " << iteration << ":" << std::endl;
-        
-        // 1. 矩阵乘法
-        std::cout << "  - Matrix multiplication..." << std::flush;
-        matrix_multiply(200);
-        std::cout << " done" << std::endl;
-        
-        // 2. 随机内存访问
-        std::cout << "  - Random memory access..." << std::flush;
-        random_memory_access(32 * 1024 * 1024);
-        std::cout << " done" << std::endl;
-        
-        // 3. 顺序内存访问
-        std::cout << "  - Sequential memory access..." << std::flush;
-        sequential_memory_access(32 * 1024 * 1024);
-        std::cout << " done" << std::endl;
-        
-        // 4. 分支密集
-        std::cout << "  - Branch intensive..." << std::flush;
-        branch_intensive(10000000);
-        std::cout << " done" << std::endl;
-        
-        // 5. 浮点计算
-        std::cout << "  - Floating point operations..." << std::flush;
-        floating_point_intensive(5000000);
-        std::cout << " done" << std::endl;
-        
-        // 6. 递归
-        std::cout << "  - Recursive calls..." << std::flush;
-        recursive_workload();
-        std::cout << " done" << std::endl;
-        
-        // 7. 向量化
-        std::cout << "  - Vectorizable loops..." << std::flush;
-        vectorizable_loop(5000000);
-        std::cout << " done" << std::endl;
-        
-        auto phase_duration = duration_cast<milliseconds>(high_resolution_clock::now() - phase_start);
-        std::cout << "  Iteration time: " << phase_duration.count() << " ms" << std::endl;
-        
-        // 检查是否超时
-        auto elapsed = duration_cast<seconds>(high_resolution_clock::now() - start_time);
-        std::cout << "  Total elapsed: " << elapsed.count() << " seconds" << std::endl;
-    }
-    
-    auto total_duration = duration_cast<seconds>(high_resolution_clock::now() - start_time);
-    std::cout << "\nPerformance test completed!" << std::endl;
-    std::cout << "Total iterations: " << iteration << std::endl;
-    std::cout << "Total duration: " << total_duration.count() << " seconds" << std::endl;
-    
     return 0;
 }
